@@ -5,3 +5,5 @@ numpy
 sentence-transformers
 google-generativeai
 reportlab
+asyncio
+aiohttp

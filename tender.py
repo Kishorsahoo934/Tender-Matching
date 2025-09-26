@@ -4,7 +4,8 @@ import pdfplumber
 import re
 import faiss
 import numpy as np
-import google.generativeai as genai
+import requests
+import json
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from reportlab.lib.pagesizes import A4
@@ -13,17 +14,15 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 import io
 from reportlab.lib.units import cm
-from reportlab.lib import colors
+import asyncio
+import aiohttp
 
-
-import io
 # ------------------- CONFIG --------------------
-genai.configure(api_key="AIzaSyDo0N65nL2pb2cqfyojrk0wb0a0osNDfEU") 
-LLM_MODEL = "gemini-1.5-flash"
-CHUNK_SIZE, OVERLAP = 800, 150
+API_KEY = "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"  # Replace with your OpenRouter key
+MODEL = "x-ai/grok-4-fast:free"
 
-# Hugging Face embedding model
-HF_EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+CHUNK_SIZE, OVERLAP = 800, 150
+HF_EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="gpu" if os.getenv("USE_GPU") == "1" else "cpu")
 
 # -------- PDF utilities --------
 def extract_text_from_pdf(file) -> str:
@@ -122,14 +121,14 @@ def score_proposal(tender_text, proposal_text, sim_score, fields):
 
     return min(100, score), reasons
 
-# -------- Gemini LLM Evaluation --------
-def gemini_eval(tender_text, proposal_text, prelim_score, company_name):
+# -------- OpenRouter LLM Evaluation (async) --------
+async def openrouter_eval(tender_text, proposal_text, prelim_score, company_name):
     prompt = f"""
 Tender requirements:
 {tender_text[:600]}
 
 Proposal:
-{proposal_text[:600]}   
+{proposal_text[:600]}
 
 Preliminary score: {prelim_score}
 
@@ -139,22 +138,29 @@ As procurement expert, give:
 - Missing key requirements
 - JSON with extracted fields (experience, license, revenue, timeline, cost)
 """
-    resp = genai.GenerativeModel(LLM_MODEL).generate_content(prompt)
-    return resp.text
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+        ) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                return result["choices"][0]["message"]["content"]
+            else:
+                return f"Error {resp.status}: {await resp.text()}"
 
 # -------- PDF Generation --------
-import io
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
 def generate_pdf(results):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer, 
-        pagesize=A4, 
-        rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30
+        buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30
     )
     elements = []
     styles = getSampleStyleSheet()
@@ -168,7 +174,7 @@ def generate_pdf(results):
 
     for r in results:
         reasons_text = "<br/>".join(r.get("reasons", []))
-        score_val = r.get("score", r.get("prelim_score", 0))  # fallback
+        score_val = r.get("score", r.get("prelim_score", 0))
         row = [
             Paragraph(str(r.get("company", "")), styles['Normal']),
             str(score_val),
@@ -180,7 +186,7 @@ def generate_pdf(results):
         ]
         table_data.append(row)
 
-    # Adjust column widths
+    # Column widths
     col_widths = [3.5*cm, 2*cm, 2.5*cm, 2.5*cm, 3*cm, 3*cm, 7*cm]
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1)
@@ -188,7 +194,7 @@ def generate_pdf(results):
         ('BACKGROUND', (0,0), (-1,0), colors.gray),
         ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
         ('ALIGN', (0,0), (-2,-1), 'CENTER'),
-        ('ALIGN', (-1,1), (-1,-1), 'LEFT'),  # Reasons left aligned
+        ('ALIGN', (-1,1), (-1,-1), 'LEFT'),
         ('VALIGN', (0,0), (-1,-1), 'TOP'),
         ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
         ('FONTSIZE', (0,0), (-1,0), 12),
@@ -199,7 +205,6 @@ def generate_pdf(results):
     elements.append(table)
     elements.append(Spacer(1, 20))
 
-    # Suggested company at bottom
     top_company = max(results, key=lambda r: r.get("score", r.get("prelim_score", 0)))
     top_score = top_company.get("score", top_company.get("prelim_score", 0))
     suggestion_text = f"""
@@ -213,51 +218,52 @@ def generate_pdf(results):
     buffer.seek(0)
     return buffer
 
-
 # ---------------- STREAMLIT APP ----------------
 st.title("📑 Tender–Proposal Matcher")
 
+# File uploads
 tender_file = st.file_uploader("Upload Tender PDF", type=["pdf"])
 proposal_files = st.file_uploader("Upload Proposal PDFs (max 10)", type=["pdf"], accept_multiple_files=True)
 
-run_button = st.button("Run Analysis")
-
-if tender_file and proposal_files and run_button:
+# Automatically run analysis once files are uploaded
+if tender_file and proposal_files:
     with st.spinner("Processing documents..."):
         tender_text = extract_text_from_pdf(tender_file)
         tender_chunks = chunk_text(tender_text)
         tender_embs = embed_texts(tender_chunks)
         tender_vec = tender_embs.mean(axis=0, keepdims=True)
 
-        # FAISS index
         idx = VectorIndex(tender_embs.shape[1])
         results = []
 
-        for file in proposal_files:
-            p_text = extract_text_from_pdf(file)
-            p_chunks = chunk_text(p_text)
-            p_embs = embed_texts(p_chunks)
-            metas = [{"file": file.name, "chunk": i, "text": c} for i, c in enumerate(p_chunks)]
-            idx.add(p_embs, metas)
+        async def process_files():
+            tasks = []
+            for file in proposal_files:
+                p_text = extract_text_from_pdf(file)
+                p_chunks = chunk_text(p_text)
+                p_embs = embed_texts(p_chunks)
+                metas = [{"file": file.name, "chunk": i, "text": c} for i, c in enumerate(p_chunks)]
+                idx.add(p_embs, metas)
+                hits = idx.search(tender_vec, top_k=10)
+                hits = [h for h in hits if h[0]["file"] == file.name]
+                sim = np.mean([s for _, s in hits]) if hits else 0.0
+                fields = extract_fields(p_text)
+                prelim, reasons = score_proposal(tender_text, p_text, sim, fields)
+                task = openrouter_eval(tender_text, p_text, prelim, file.name)
+                tasks.append((file.name, prelim, reasons, fields, task))
+            return tasks
 
-            # Similarity score
-            hits = idx.search(tender_vec, top_k=10)
-            hits = [h for h in hits if h[0]["file"] == file.name]
-            sim = np.mean([s for _, s in hits]) if hits else 0.0
-
-            fields = extract_fields(p_text)
-            prelim, reasons = score_proposal(tender_text, p_text, sim, fields)
-            gem_eval = gemini_eval(tender_text, p_text, prelim, file.name)
-
+        tasks = asyncio.run(process_files())
+        for company, prelim, reasons, fields, coro in tasks:
+            gem_eval = asyncio.run(coro)
             results.append({
-                "company": file.name,
+                "company": company,
                 "prelim_score": prelim,
                 "reasons": reasons,
                 "fields": fields,
                 "gemini_eval": gem_eval
             })
 
-        # Rank
         ranked = sorted(results, key=lambda r: r["prelim_score"], reverse=True)
 
     st.subheader("🏆 Ranked Companies")
@@ -269,7 +275,6 @@ if tender_file and proposal_files and run_button:
             st.json(r["fields"])
             st.write(r["gemini_eval"])
 
-    # Generate and provide PDF
     pdf_buffer = generate_pdf(ranked)
     st.download_button(
         label="📥 Download Comparison PDF",
