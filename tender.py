@@ -1,284 +1,185 @@
-import os
 import streamlit as st
+import tempfile
 import pdfplumber
-import re
-import faiss
-import numpy as np
-import requests
-import json
-from pathlib import Path
-from sentence_transformers import SentenceTransformer
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib import colors
+import fitz  # PyMuPDF
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+import google.generativeai as genai
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
-import io
-from reportlab.lib.units import cm
-import asyncio
-import aiohttp
+from reportlab.lib import colors
+import os
 
-# ------------------- CONFIG --------------------
-API_KEY = "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"  # Replace with your OpenRouter key
-MODEL = "x-ai/grok-4-fast:free"
-
+# ---------------- CONFIG ----------------
+genai.configure(api_key="YOUR_GEMINI_KEY")  # replace with your real key
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL = "models/gemini-2.5-flash"
 CHUNK_SIZE, OVERLAP = 800, 150
-HF_EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="gpu" if os.getenv("USE_GPU") == "1" else "cpu")
 
-# -------- PDF utilities --------
-def extract_text_from_pdf(file) -> str:
-    text = []
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text.append(page_text)
-    return "\n".join(text)
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
-    chunks, start = [], 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start = max(0, end - overlap)
-        if end >= len(text):
-            break
-    return chunks
+# ---------------- HELPERS ----------------
+def extract_text_pdf(file_path: str) -> str:
+    """Try extracting text using pdfplumber, fallback to OCR with PyMuPDF."""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            text = "".join([page.extract_text() or "" for page in pdf.pages])
+        if text.strip():
+            return text
+    except Exception:
+        pass
+    return extract_text_ocr(file_path)
 
-# -------- Embedding & FAISS --------
-def embed_texts(texts):
-    vectors = HF_EMBED_MODEL.encode(
-        texts, convert_to_numpy=True, normalize_embeddings=True
-    )
-    return np.array(vectors, dtype=np.float32)
 
-class VectorIndex:
-    def __init__(self, dim: int):
-        self.index = faiss.IndexFlatIP(dim)
-        self.metadatas = []
+def extract_text_ocr(file_path: str) -> str:
+    """OCR extraction using PyMuPDF."""
+    try:
+        pdf_document = fitz.open(file_path)
+        text = ""
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            text += page.get_text("text")
+        return text
+    except Exception as e:
+        st.error(f"OCR extraction failed: {e}")
+        return ""
 
-    def add(self, vectors, metadatas):
-        self.index.add(vectors)
-        self.metadatas.extend(metadatas)
 
-    def search(self, query_vec, top_k=5):
-        D, I = self.index.search(query_vec, top_k)
-        results = []
-        for i, idx in enumerate(I[0]):
-            if idx < 0:
-                continue
-            score = float(D[0][i])
-            results.append((self.metadatas[idx], score))
-        return results
+def process_and_embed(text: str):
+    """Split text into chunks and embed with HuggingFace."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP)
+    chunks = splitter.split_text(text)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    db = FAISS.from_texts(chunks, embedding=embeddings)
+    return db
 
-# -------- Field Extraction --------
-def extract_fields(text: str):
-    fields = {}
-    m = re.search(r'(\d+)\s+years', text, re.I)
-    fields["experience"] = int(m.group(1)) if m else None
-    if "valid" in text.lower() and "license" in text.lower():
-        fields["license"] = "valid"
-    elif "pending" in text.lower() and "license" in text.lower():
-        fields["license"] = "pending"
-    m = re.search(r'\$([\d,]+[kK]?)', text)
-    fields["revenue"] = m.group(1) if m else None
-    m = re.search(r'(\d+)\s+(months|month|years|year)', text, re.I)
-    if m:
-        num = int(m.group(1))
-        fields["timeline_months"] = num * (12 if "year" in m.group(2).lower() else 1)
-    m = re.search(r'\$([\d,]+)', text)
-    fields["cost"] = m.group(1) if m else None
-    return fields
 
-# -------- Scoring (simple hybrid) --------
-def score_proposal(tender_text, proposal_text, sim_score, fields):
-    score, reasons = 0, []
-
-    experience = fields.get("experience") or 0
-    if experience >= 5:
-        score += 20
-        reasons.append("Experience ≥5 yrs ✅")
-    else:
-        reasons.append("Experience <5 yrs ❌")
-
-    if fields.get("license") == "valid":
-        score += 15
-        reasons.append("Valid license ✅")
-    else:
-        reasons.append("License missing/invalid ❌")
-
-    score += int(sim_score * 25)
-    reasons.append(f"Technical similarity {sim_score:.2f}")
-
-    timeline = fields.get("timeline_months") or 999
-    if timeline <= 6:
-        score += 10
-        reasons.append("Timeline within 6 months ✅")
-    else:
-        reasons.append("Timeline too long ❌")
-
-    if fields.get("revenue"):
-        score += 10
-        reasons.append("Financial info provided ✅")
-
-    return min(100, score), reasons
-
-# -------- OpenRouter LLM Evaluation (async) --------
-async def openrouter_eval(tender_text, proposal_text, prelim_score, company_name):
-    prompt = f"""
-Tender requirements:
-{tender_text[:600]}
-
-Proposal:
-{proposal_text[:600]}
-
-Preliminary score: {prelim_score}
-
-As procurement expert, give:
-- Final SCORE (0-100)
-- 2–3 sentence REASON
-- Missing key requirements
-- JSON with extracted fields (experience, license, revenue, timeline, cost)
-"""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": prompt}]
-            }
-        ) as resp:
-            if resp.status == 200:
-                result = await resp.json()
-                return result["choices"][0]["message"]["content"]
-            else:
-                return f"Error {resp.status}: {await resp.text()}"
-
-# -------- PDF Generation --------
-def generate_pdf(results):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30
-    )
-    elements = []
+def generate_pdf_report(filename, tender_text, company_name, company_text, evaluation):
+    """Generate PDF report with ReportLab."""
     styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(filename)
 
-    # Title
-    elements.append(Paragraph("Tender–Proposal Comparison Report", styles['Title']))
-    elements.append(Spacer(1, 20))
+    story = []
 
-    # Table header
-    table_data = [["Company", "Score", "Experience", "License", "Revenue", "Timeline (months)", "Reasons"]]
+    story.append(Paragraph("📑 Tender–Proposal Evaluation Report", styles["Title"]))
+    story.append(Spacer(1, 20))
 
-    for r in results:
-        reasons_text = "<br/>".join(r.get("reasons", []))
-        score_val = r.get("score", r.get("prelim_score", 0))
-        row = [
-            Paragraph(str(r.get("company", "")), styles['Normal']),
-            str(score_val),
-            str(r.get("fields", {}).get("experience", "")),
-            str(r.get("fields", {}).get("license", "")),
-            str(r.get("fields", {}).get("revenue", "")),
-            str(r.get("fields", {}).get("timeline_months", "")),
-            Paragraph(reasons_text, styles['Normal'])
-        ]
-        table_data.append(row)
+    story.append(Paragraph("<b>Tender Document Extract:</b>", styles["Heading2"]))
+    story.append(Paragraph(tender_text[:800] + "...", styles["Normal"]))
+    story.append(Spacer(1, 10))
 
-    # Column widths
-    col_widths = [3.5*cm, 2*cm, 2.5*cm, 2.5*cm, 3*cm, 3*cm, 7*cm]
+    story.append(Paragraph(f"<b>Company Proposal Extract ({company_name}):</b>", styles["Heading2"]))
+    story.append(Paragraph(company_text[:800] + "...", styles["Normal"]))
+    story.append(Spacer(1, 10))
 
-    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    story.append(Paragraph("<b>Evaluation Result:</b>", styles["Heading2"]))
+    story.append(Paragraph(evaluation, styles["Normal"]))
+    story.append(Spacer(1, 20))
+
+    # Add summary table
+    data = [
+        ["Aspect", "Status"],
+        ["Experience", "Checked"],
+        ["License", "Checked"],
+        ["Timeline", "Checked"],
+        ["Financials", "Checked"]
+    ]
+    table = Table(data, colWidths=[200, 200])
     table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.gray),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-        ('ALIGN', (0,0), (-2,-1), 'CENTER'),
-        ('ALIGN', (-1,1), (-1,-1), 'LEFT'),
-        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,0), 12),
-        ('BOTTOMPADDING', (0,0), (-1,0), 8),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.black)
+        ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
     ]))
+    story.append(table)
 
-    elements.append(table)
-    elements.append(Spacer(1, 20))
+    doc.build(story)
 
-    top_company = max(results, key=lambda r: r.get("score", r.get("prelim_score", 0)))
-    top_score = top_company.get("score", top_company.get("prelim_score", 0))
-    suggestion_text = f"""
-    <b>Suggested Proposal to Accept:</b> {top_company.get('company','')}<br/>
-    <b>Score:</b> {top_score}<br/>
-    <b>Reason:</b> {'; '.join(top_company.get('reasons', []))}
-    """
-    elements.append(Paragraph(suggestion_text, styles['Heading2']))
-
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer
 
 # ---------------- STREAMLIT APP ----------------
+st.set_page_config(page_title="Tender–Proposal Matcher", layout="wide")
 st.title("📑 Tender–Proposal Matcher")
 
-# File uploads
-tender_file = st.file_uploader("Upload Tender PDF", type=["pdf"])
-proposal_files = st.file_uploader("Upload Proposal PDFs (max 10)", type=["pdf"], accept_multiple_files=True)
+tender_pdf = st.file_uploader("Upload Tender Document (PDF)", type=["pdf"])
+company_pdfs = st.file_uploader("Upload Company Proposals (up to 10 PDFs)", type=["pdf"], accept_multiple_files=True)
 
-# Automatically run analysis once files are uploaded
-if tender_file and proposal_files:
-    with st.spinner("Processing documents..."):
-        tender_text = extract_text_from_pdf(tender_file)
-        tender_chunks = chunk_text(tender_text)
-        tender_embs = embed_texts(tender_chunks)
-        tender_vec = tender_embs.mean(axis=0, keepdims=True)
+if st.button("Process & Match"):
+    if not tender_pdf or not company_pdfs:
+        st.error("⚠ Please upload both a Tender PDF and at least one Company PDF.")
+    else:
+        # --- Tender file ---
+        temp_tender = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tender_pdf.seek(0)
+        tender_data = tender_pdf.read()
+        if not tender_data:
+            st.error("⚠ Tender PDF seems empty.")
+            st.stop()
+        temp_tender.write(tender_data)
+        temp_tender.flush()
+        tender_text = extract_text_pdf(temp_tender.name)
 
-        idx = VectorIndex(tender_embs.shape[1])
-        results = []
+        if not tender_text.strip():
+            st.error("⚠ Could not extract text from Tender PDF.")
+            st.stop()
 
-        async def process_files():
-            tasks = []
-            for file in proposal_files:
-                p_text = extract_text_from_pdf(file)
-                p_chunks = chunk_text(p_text)
-                p_embs = embed_texts(p_chunks)
-                metas = [{"file": file.name, "chunk": i, "text": c} for i, c in enumerate(p_chunks)]
-                idx.add(p_embs, metas)
-                hits = idx.search(tender_vec, top_k=10)
-                hits = [h for h in hits if h[0]["file"] == file.name]
-                sim = np.mean([s for _, s in hits]) if hits else 0.0
-                fields = extract_fields(p_text)
-                prelim, reasons = score_proposal(tender_text, p_text, sim, fields)
-                task = openrouter_eval(tender_text, p_text, prelim, file.name)
-                tasks.append((file.name, prelim, reasons, fields, task))
-            return tasks
+        # --- Embedding ---
+        st.write("🔍 Creating embeddings...")
+        tender_db = process_and_embed(tender_text)
 
-        tasks = asyncio.run(process_files())
-        for company, prelim, reasons, fields, coro in tasks:
-            gem_eval = asyncio.run(coro)
-            results.append({
-                "company": company,
-                "prelim_score": prelim,
-                "reasons": reasons,
-                "fields": fields,
-                "gemini_eval": gem_eval
-            })
+        # --- Loop over company proposals ---
+        llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, api_key="AIzaSyDo0N65nL2pb2cqfyojrk0wb0a0osNDfEU")
+        template = """
+        You are an expert evaluator.
+        Compare the Tender requirements with the Company Proposal.
+        Highlight matches, mismatches, and overall suitability.
 
-        ranked = sorted(results, key=lambda r: r["prelim_score"], reverse=True)
+        TENDER DOCUMENT:
+        {tender}
 
-    st.subheader("🏆 Ranked Companies")
-    for r in ranked:
-        with st.expander(f"{r['company']} — Score {r['prelim_score']}"):
-            st.write("**Reasons:**")
-            for reason in r["reasons"]:
-                st.write("- " + reason)
-            st.json(r["fields"])
-            st.write(r["gemini_eval"])
+        COMPANY PROPOSAL:
+        {company}
 
-    pdf_buffer = generate_pdf(ranked)
-    st.download_button(
-        label="📥 Download Comparison PDF",
-        data=pdf_buffer,
-        file_name="Tender_Comparison_Report.pdf",
-        mime="application/pdf"
-    )
+        Give a clear evaluation and a match score (0–100).
+        """
+        prompt = PromptTemplate(template=template, input_variables=["tender", "company"])
+
+        for company_pdf in company_pdfs:
+            # Save company file
+            temp_company = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            company_pdf.seek(0)
+            company_data = company_pdf.read()
+            if not company_data:
+                st.warning(f"⚠ {company_pdf.name} seems empty, skipping.")
+                continue
+            temp_company.write(company_data)
+            temp_company.flush()
+
+            company_text = extract_text_pdf(temp_company.name)
+            if not company_text.strip():
+                st.warning(f"⚠ Could not extract text from {company_pdf.name}, skipping.")
+                continue
+
+            # --- Run evaluation ---
+            chain_input = {"tender": tender_text, "company": company_text}
+            response = llm.invoke(prompt.format(**chain_input))
+
+            # --- Results ---
+            st.subheader(f"📊 Evaluation Result for {company_pdf.name}")
+            st.write(response.content)
+
+            # --- Generate Report for each company ---
+            report_path = os.path.join(tempfile.gettempdir(), f"tender_report_{company_pdf.name}.pdf")
+            generate_pdf_report(report_path, tender_text, company_pdf.name, company_text, response.content)
+
+            with open(report_path, "rb") as f:
+                st.download_button(
+                    f"📥 Download Report for {company_pdf.name}",
+                    f,
+                    file_name=f"tender_report_{company_pdf.name}.pdf",
+                    mime="application/pdf"
+                )
